@@ -1,0 +1,107 @@
+#!/bin/bash
+# ============================================================
+# 微信主动推送模块 (基于 openclaw-weixin 底层 HTTP API)
+# 直接对照官方源码 src/api/api.ts + src/messaging/send.ts 实现
+# ============================================================
+
+# 接收传参或管道输入
+if [ "$#" -gt 0 ]; then
+    MESSAGE="$1"
+else
+    MESSAGE=$(cat)
+fi
+
+if [ -z "$MESSAGE" ]; then
+    echo "错误: 没有要发送的消息"
+    exit 1
+fi
+
+# 账号配置文件
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$(python3 -c "import json; print(json.load(open('$SCRIPT_DIR/../config.json'))['wechat'])")"
+
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "错误: 找不到微信账号配置文件 $CONFIG_FILE"
+    exit 1
+fi
+
+# 用 Python 构建完整请求并发送（严格对照官方源码 api.ts + send.ts）
+RESPONSE=$(python3 -c "
+import json, sys, random, base64, urllib.request, urllib.error
+
+# 读取配置
+with open('/export/home2/mhd/.openclaw/openclaw-weixin/accounts/37ea63de7cb6-im-bot.json', 'r') as f:
+    config = json.load(f)
+
+base_url = config['baseUrl'].rstrip('/')
+token = config['token']
+user_id = config['userId']
+
+# 从 stdin 读取消息
+message = sys.stdin.read()
+
+# 构建请求体
+payload = {
+    'msg': {
+        'from_user_id': '',
+        'to_user_id': user_id,
+        'client_id': f'openclaw-weixin-notify-{random.randint(100000, 999999)}',
+        'message_type': 2,
+        'message_state': 2,
+        'item_list': [
+            {
+                'type': 1,
+                'text_item': {'text': message}
+            }
+        ]
+    },
+}
+
+body_bytes = json.dumps(payload).encode('utf-8')
+
+# 构建请求头
+uint32 = random.getrandbits(32)
+uin_b64 = base64.b64encode(str(uint32).encode('utf-8')).decode('utf-8')
+url = f'{base_url}/ilink/bot/sendmessage'
+
+headers = {
+    'Content-Type': 'application/json',
+    'AuthorizationType': 'ilink_bot_token',
+    'Authorization': f'Bearer {token}',
+    'Content-Length': str(len(body_bytes)),
+    'X-WECHAT-UIN': uin_b64,
+}
+
+req = urllib.request.Request(url, data=body_bytes, headers=headers, method='POST')
+
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = resp.read().decode('utf-8')
+        print(result)
+except urllib.error.HTTPError as e:
+    body = e.read().decode('utf-8', errors='replace')
+    print(json.dumps({'error': f'HTTP {e.code}', 'body': body}))
+except Exception as e:
+    print(json.dumps({'error': str(e)}))
+" <<< "$MESSAGE")
+
+if [ -z "$RESPONSE" ]; then
+    echo "推送失败: API 返回为空 (可能网络不通或请求超时)"
+    exit 1
+fi
+
+if echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    # {} 空对象也视为成功（消息实际已送达）
+    sys.exit(0 if data == {} or data.get('ret', -1) == 0 else 1)
+except Exception:
+    sys.exit(1)
+"; then
+    echo "推送成功！请检查手机微信。"
+else
+    echo "推送失败，请查看上方 API 返回内容排查原因。"
+    exit 1
+fi
